@@ -160,7 +160,7 @@ const SKILL_RESOLVER_CONFIG = JSON.stringify({
   },
 })
 
-async function askAgent(prompt: string, worktree: string): Promise<string> {
+async function askAgent(prompt: string, worktree: string, abort?: AbortSignal): Promise<string> {
   const proc = Bun.spawn(
     ["opencode", "run", "--agent", "skill-resolver", "--dangerously-skip-permissions", "--format", "json"],
     {
@@ -175,33 +175,40 @@ async function askAgent(prompt: string, worktree: string): Promise<string> {
     },
   )
 
+  const onAbort = () => proc.kill()
+  abort?.addEventListener("abort", onAbort)
+
   proc.stdin.write(prompt)
   proc.stdin.end()
-
-  const raw = await new Response(proc.stdout).text()
-  await proc.exited
 
   let sessionID: string | undefined
   const textParts: string[] = []
 
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim()
-    if (!trimmed) continue
-    try {
-      const event = JSON.parse(trimmed)
-      if (!sessionID && event.sessionID) sessionID = event.sessionID
-      if (event.type === "text" && event.part?.text) textParts.push(event.part.text)
-    } catch {
-      // not JSON, skip
-    }
-  }
+  try {
+    const raw = await new Response(proc.stdout).text()
+    await proc.exited
 
-  if (sessionID) {
-    await Bun.spawn(["opencode", "session", "delete", sessionID], {
-      cwd: worktree,
-      stdout: "ignore",
-      stderr: "ignore",
-    }).exited
+    for (const line of raw.split("\n")) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      try {
+        const event = JSON.parse(trimmed)
+        if (!sessionID && event.sessionID) sessionID = event.sessionID
+        if (event.type === "text" && event.part?.text) textParts.push(event.part.text)
+      } catch {
+        // not JSON, skip
+      }
+    }
+  } finally {
+    abort?.removeEventListener("abort", onAbort)
+
+    if (sessionID) {
+      await Bun.spawn(["opencode", "session", "delete", sessionID], {
+        cwd: worktree,
+        stdout: "ignore",
+        stderr: "ignore",
+      }).exited
+    }
   }
 
   return textParts.join("").trim()
@@ -270,7 +277,7 @@ export default tool({
     const exact = skills.find((s) => s.name === query)
 
     const prompt = buildResolverPrompt(query, exact?.name)
-    const answer = await askAgent(prompt, context.worktree)
+    const answer = await askAgent(prompt, context.worktree, context.abort)
 
     const resolvedNames = parseResolvedSkillNames(answer)
     if (resolvedNames.length === 0) {
