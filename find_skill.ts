@@ -1,17 +1,17 @@
-import { tool } from "@opencode-ai/plugin"
-import { readdir, readFile, access } from "fs/promises"
-import path from "path"
-import os from "os"
+import { tool } from "@opencode-ai/plugin";
+import { readdir, readFile, access } from "fs/promises";
+import path from "path";
+import os from "os";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 interface SkillMeta {
-  name: string
-  description: string
-  location: string
-  body: string
+  name: string;
+  description: string;
+  location: string;
+  body: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -19,34 +19,34 @@ interface SkillMeta {
 // ---------------------------------------------------------------------------
 
 function parseFrontmatter(raw: string): {
-  name?: string
-  description?: string
-  body: string
+  name?: string;
+  description?: string;
+  body: string;
 } {
-  const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/)
-  if (!match) return { body: raw }
+  const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
+  if (!match) return { body: raw };
 
-  const frontmatter = match[1]
-  const body = match[2]
+  const frontmatter = match[1];
+  const body = match[2];
 
-  let name: string | undefined
-  let description: string | undefined
+  let name: string | undefined;
+  let description: string | undefined;
 
   for (const line of frontmatter.split("\n")) {
-    const nameMatch = line.match(/^name:\s*"?([^"]*)"?\s*$/)
+    const nameMatch = line.match(/^name:\s*"?([^"]*)"?\s*$/);
     if (nameMatch) {
-      name = nameMatch[1].trim()
-      continue
+      name = nameMatch[1].trim();
+      continue;
     }
-    const descMatch = line.match(/^description:\s*"?(.*)"?\s*$/)
+    const descMatch = line.match(/^description:\s*"?(.*)"?\s*$/);
     if (descMatch) {
-      description = descMatch[1].trim()
-      if (description.endsWith('"')) description = description.slice(0, -1)
-      continue
+      description = descMatch[1].trim();
+      if (description.endsWith('"')) description = description.slice(0, -1);
+      continue;
     }
   }
 
-  return { name, description, body }
+  return { name, description, body };
 }
 
 // ---------------------------------------------------------------------------
@@ -55,34 +55,34 @@ function parseFrontmatter(raw: string): {
 
 async function dirExists(dir: string): Promise<boolean> {
   try {
-    await access(dir)
-    return true
+    await access(dir);
+    return true;
   } catch {
-    return false
+    return false;
   }
 }
 
 async function scanSkillsDir(dir: string): Promise<SkillMeta[]> {
-  if (!(await dirExists(dir))) return []
+  if (!(await dirExists(dir))) return [];
 
-  const entries = await readdir(dir, { withFileTypes: true })
-  const skills: SkillMeta[] = []
+  const entries = await readdir(dir, { withFileTypes: true });
+  const skills: SkillMeta[] = [];
 
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue
-    const skillFile = path.join(dir, entry.name, "SKILL.md")
+    if (!entry.isDirectory()) continue;
+    const skillFile = path.join(dir, entry.name, "SKILL.md");
     try {
-      const raw = await readFile(skillFile, "utf-8")
-      const { name, description, body } = parseFrontmatter(raw)
+      const raw = await readFile(skillFile, "utf-8");
+      const { name, description, body } = parseFrontmatter(raw);
       if (name && description) {
-        skills.push({ name, description, location: skillFile, body })
+        skills.push({ name, description, location: skillFile, body });
       }
     } catch {
       // no SKILL.md or unreadable -- skip
     }
   }
 
-  return skills
+  return skills;
 }
 
 function projectSkillDirs(worktree: string): string[] {
@@ -90,34 +90,34 @@ function projectSkillDirs(worktree: string): string[] {
     path.join(worktree, ".opencode", "skills"),
     path.join(worktree, ".claude", "skills"),
     path.join(worktree, ".agents", "skills"),
-  ]
+  ];
 }
 
 function globalSkillDirs(): string[] {
-  const home = os.homedir()
+  const home = os.homedir();
   return [
     path.join(home, ".config", "opencode", "skills"),
     path.join(home, ".claude", "skills"),
     path.join(home, ".config", "agents", "skills"),
     path.join(home, ".agents", "skills"),
-  ]
+  ];
 }
 
 async function discoverSkills(worktree: string): Promise<SkillMeta[]> {
-  const dirs = [...projectSkillDirs(worktree), ...globalSkillDirs()]
-  const results = await Promise.all(dirs.map(scanSkillsDir))
-  const flat = results.flat()
+  const dirs = [...projectSkillDirs(worktree), ...globalSkillDirs()];
+  const results = await Promise.all(dirs.map(scanSkillsDir));
+  const flat = results.flat();
 
   // dedupe by name -- first occurrence wins (project > global)
-  const seen = new Set<string>()
-  const deduped: SkillMeta[] = []
+  const seen = new Set<string>();
+  const deduped: SkillMeta[] = [];
   for (const skill of flat) {
-    if (seen.has(skill.name)) continue
-    seen.add(skill.name)
-    deduped.push(skill)
+    if (seen.has(skill.name)) continue;
+    seen.add(skill.name);
+    deduped.push(skill);
   }
 
-  return deduped
+  return deduped;
 }
 
 // ---------------------------------------------------------------------------
@@ -131,39 +131,65 @@ const SKILL_RESOLVER_SYSTEM_PROMPT = [
   "2. Use the `skill` tool to load them.",
   "3. Check for required dependencies and load them.",
   "4. Repeat until no more required skills remain.",
-  "5. Reply with ONLY a valid JSON array of skill names in order, starting skill first.",
+  "5. Your final message must be a valid JSON array of skill names and nothing else. No prose before it, no prose after it, no markdown formatting.",
   '   For example: ["debugging-failed-builds","using-buildkite"]',
   "   Return [] if nothing matched.",
   "",
   "If the query covers multiple concepts, return multiple skills that match. Include all relevant skills, not just one.",
   "Only include skills that are explicitly required or instructed. Ignore optional suggestions, examples, and loosely related references.",
-  "Use exact skill names. No explanation, no markdown, no prose.",
-].join("\n")
+  "Use exact skill names.",
+].join("\n");
 
 function buildResolverPrompt(query: string, exactSkillName?: string): string {
   if (exactSkillName) {
-    return `Load this skill and resolve its dependencies: ${exactSkillName}`
+    return `Load this skill and resolve its dependencies: ${exactSkillName}`;
   }
-  return `Find the best matching skill(s) and resolve their dependencies for this query: ${query}`
+  return `Find the best matching skill(s) and resolve their dependencies for this query: ${query}`;
 }
 
-const SKILL_RESOLVER_CONFIG = JSON.stringify({
-  agent: {
-    "skill-resolver": {
-      mode: "all",
-      hidden: true,
-      prompt: SKILL_RESOLVER_SYSTEM_PROMPT,
-      permission: {
-        "*": "deny",
-        skill: "allow",
+function isLocalAgent(agentName: string | undefined): boolean {
+  if (!agentName) return false;
+  return /local/i.test(agentName);
+}
+
+const LOCAL_MODEL = "lmstudio/unsloth/qwen3.5-9b";
+const CLOUD_MODEL = "anthropic/claude-haiku-4-5";
+
+function buildSkillResolverConfig(callingAgent: string | undefined): string {
+  const model = isLocalAgent(callingAgent) ? LOCAL_MODEL : CLOUD_MODEL;
+
+  return JSON.stringify({
+    agent: {
+      "skill-resolver": {
+        mode: "all",
+        hidden: true,
+        prompt: SKILL_RESOLVER_SYSTEM_PROMPT,
+        model,
+        permission: {
+          "*": "deny",
+          skill: "allow",
+        },
       },
     },
-  },
-})
+  });
+}
 
-async function askAgent(prompt: string, worktree: string, abort?: AbortSignal): Promise<string> {
+async function askAgent(
+  prompt: string,
+  worktree: string,
+  callingAgent: string | undefined,
+  abort?: AbortSignal,
+): Promise<string> {
   const proc = Bun.spawn(
-    ["opencode", "run", "--agent", "skill-resolver", "--dangerously-skip-permissions", "--format", "json"],
+    [
+      "opencode",
+      "run",
+      "--agent",
+      "skill-resolver",
+      "--dangerously-skip-permissions",
+      "--format",
+      "json",
+    ],
     {
       cwd: worktree,
       stdout: "pipe",
@@ -171,67 +197,68 @@ async function askAgent(prompt: string, worktree: string, abort?: AbortSignal): 
       stdin: "pipe",
       env: {
         ...process.env,
-        OPENCODE_CONFIG_CONTENT: SKILL_RESOLVER_CONFIG,
+        OPENCODE_CONFIG_CONTENT: buildSkillResolverConfig(callingAgent),
       },
     },
-  )
+  );
 
-  const onAbort = () => proc.kill()
-  abort?.addEventListener("abort", onAbort)
+  const onAbort = () => proc.kill();
+  abort?.addEventListener("abort", onAbort);
 
-  proc.stdin.write(prompt)
-  proc.stdin.end()
+  proc.stdin.write(prompt);
+  proc.stdin.end();
 
-  let sessionID: string | undefined
-  const textParts: string[] = []
+  let sessionID: string | undefined;
+  const textParts: string[] = [];
 
   try {
-    const raw = await new Response(proc.stdout).text()
-    await proc.exited
+    const raw = await new Response(proc.stdout).text();
+    await proc.exited;
 
     for (const line of raw.split("\n")) {
-      const trimmed = line.trim()
-      if (!trimmed) continue
+      const trimmed = line.trim();
+      if (!trimmed) continue;
       try {
-        const event = JSON.parse(trimmed)
-        if (!sessionID && event.sessionID) sessionID = event.sessionID
-        if (event.type === "text" && event.part?.text) textParts.push(event.part.text)
+        const event = JSON.parse(trimmed);
+        if (!sessionID && event.sessionID) sessionID = event.sessionID;
+        if (event.type === "text" && event.part?.text)
+          textParts.push(event.part.text);
       } catch {
         // not JSON, skip
       }
     }
   } finally {
-    abort?.removeEventListener("abort", onAbort)
+    abort?.removeEventListener("abort", onAbort);
 
     if (sessionID) {
       await Bun.spawn(["opencode", "session", "delete", sessionID], {
         cwd: worktree,
         stdout: "ignore",
         stderr: "ignore",
-      }).exited
+      }).exited;
     }
   }
 
-  return textParts.join("").trim()
+  return textParts.join("").trim().split("\n").at(-1) ?? "";
 }
 
 function parseResolvedSkillNames(answer: string): string[] {
   try {
-    const parsed = JSON.parse(answer)
-    if (!Array.isArray(parsed)) return []
+    const parsed = JSON.parse(answer);
+    if (!Array.isArray(parsed)) return [];
 
-    const seen = new Set<string>()
+    const seen = new Set<string>();
 
     return parsed
       .filter((value): value is string => typeof value === "string")
       .map((value) => value.trim().toLowerCase())
       .filter((value) => {
-        if (!value || seen.has(value)) return false
-        seen.add(value)
-        return true
-      })
+        if (!value || seen.has(value)) return false;
+        seen.add(value);
+        return true;
+      });
   } catch {
-    return []
+    return [];
   }
 }
 
@@ -240,12 +267,12 @@ function parseResolvedSkillNames(answer: string): string[] {
 // ---------------------------------------------------------------------------
 
 function humanize(name: string): string {
-  return name.replace(/-/g, " ")
+  return name.replace(/-/g, " ");
 }
 
 // discover skills at load time so the description stays in sync
-const bootSkills = await discoverSkills(process.cwd())
-const skillList = bootSkills.map((s) => humanize(s.name)).join(", ")
+const bootSkills = await discoverSkills(process.cwd());
+const skillList = bootSkills.map((s) => humanize(s.name)).join(", ");
 const description = [
   "Find domain-specific instructions by describing what you're about to do. " +
     "Skills contain step-by-step workflows, scripts, and conventions you " +
@@ -255,7 +282,7 @@ const description = [
   bootSkills.length > 0
     ? `Skills cover things like: ${skillList}.`
     : "No skills are currently available.",
-].join("\n")
+].join("\n");
 
 export default tool({
   description,
@@ -268,75 +295,80 @@ export default tool({
       ),
   },
   async execute(args, context) {
-    const skills = await discoverSkills(context.worktree)
+    const skills = await discoverSkills(context.worktree);
 
     if (skills.length === 0) {
-      return "No skills found. Check that SKILL.md files exist in the expected locations."
+      return "No skills found. Check that SKILL.md files exist in the expected locations.";
     }
 
-    const query = args.query.trim()
-    const exact = skills.find((s) => s.name === query)
+    const query = args.query.trim();
+    const exact = skills.find((s) => s.name === query);
 
-    const prompt = buildResolverPrompt(query, exact?.name)
-    const answer = await askAgent(prompt, context.worktree, context.abort)
+    const prompt = buildResolverPrompt(query, exact?.name);
+    const answer = await askAgent(
+      prompt,
+      context.worktree,
+      context.agent,
+      context.abort,
+    );
 
-    const resolvedNames = parseResolvedSkillNames(answer)
+    const resolvedNames = parseResolvedSkillNames(answer);
     if (resolvedNames.length === 0) {
       return (
         `No skill matched the query "${query}".\n\n` +
         "Available skill names for reference:\n" +
         skills.map((s) => `- ${s.name}`).join("\n")
-      )
+      );
     }
 
     const resolvedSkills = resolvedNames
       .map((name) => skills.find((skill) => skill.name === name))
-      .filter((skill): skill is SkillMeta => Boolean(skill))
+      .filter((skill): skill is SkillMeta => Boolean(skill));
 
     if (resolvedSkills.length === 0) {
       return (
         `The skill resolver suggested ${answer} but none of those skills were found.\n\n` +
         "Available skill names for reference:\n" +
         skills.map((s) => `- ${s.name}: ${s.description}`).join("\n")
-      )
+      );
     }
 
     if (resolvedSkills.length !== resolvedNames.length) {
       const missing = resolvedNames.filter(
         (name) => !resolvedSkills.some((skill) => skill.name === name),
-      )
+      );
 
       return (
         `The skill resolver suggested missing skills: ${missing.join(", ")}.\n\n` +
         "Available skill names for reference:\n" +
         skills.map((s) => `- ${s.name}: ${s.description}`).join("\n")
-      )
+      );
     }
 
-    context.metadata({ title: resolvedSkills[0].name })
-    return await formatSkillContent(resolvedSkills)
+    context.metadata({ title: resolvedSkills[0].name });
+    return await formatSkillContent(resolvedSkills);
   },
-})
+});
 
 async function listSkillFiles(skillLocation: string): Promise<string[]> {
-  const dir = path.dirname(skillLocation)
+  const dir = path.dirname(skillLocation);
   try {
-    const entries = (await readdir(dir, { recursive: true })) as string[]
+    const entries = (await readdir(dir, { recursive: true })) as string[];
     return entries
       .filter((e) => e !== "SKILL.md")
       .map((e) => path.resolve(dir, e))
-      .slice(0, 10)
+      .slice(0, 10);
   } catch {
-    return []
+    return [];
   }
 }
 
 async function formatSkillContent(skills: SkillMeta[]): Promise<string> {
   const sections = await Promise.all(
     skills.map(async (skill) => {
-      const dir = path.dirname(skill.location)
-      const files = await listSkillFiles(skill.location)
-      const fileList = files.map((f) => `<file>${f}</file>`).join("\n")
+      const dir = path.dirname(skill.location);
+      const files = await listSkillFiles(skill.location);
+      const fileList = files.map((f) => `<file>${f}</file>`).join("\n");
 
       return [
         `<skill_content name="${skill.name}">`,
@@ -355,9 +387,9 @@ async function formatSkillContent(skills: SkillMeta[]): Promise<string> {
         fileList,
         "</skill_files>",
         "</skill_content>",
-      ].join("\n")
+      ].join("\n");
     }),
-  )
+  );
 
-  return sections.join("\n\n")
+  return sections.join("\n\n");
 }
