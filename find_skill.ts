@@ -127,14 +127,15 @@ async function discoverSkills(worktree: string): Promise<SkillMeta[]> {
 const SKILL_RESOLVER_SYSTEM_PROMPT = [
   "You are a skill resolver. Follow these steps exactly:",
   "",
-  "1. If a starting skill is provided, use it. Otherwise pick the best matching skill from the available skills list.",
-  "2. Use the `skill` tool to load it.",
-  "3. Identify any skills it explicitly requires the caller to load before continuing.",
-  "4. Use the `skill` tool to load each required skill and repeat until no more required skills remain.",
+  "1. If a starting skill is provided, use it. Otherwise pick the best matching skill(s) from the available skills list.",
+  "2. Use the `skill` tool to load them.",
+  "3. Check for required dependencies and load them.",
+  "4. Repeat until no more required skills remain.",
   "5. Reply with ONLY a valid JSON array of skill names in order, starting skill first.",
   '   For example: ["debugging-failed-builds","using-buildkite"]',
   "   Return [] if nothing matched.",
   "",
+  "If the query covers multiple concepts, return multiple skills that match. Include all relevant skills, not just one.",
   "Only include skills that are explicitly required or instructed. Ignore optional suggestions, examples, and loosely related references.",
   "Use exact skill names. No explanation, no markdown, no prose.",
 ].join("\n")
@@ -143,7 +144,7 @@ function buildResolverPrompt(query: string, exactSkillName?: string): string {
   if (exactSkillName) {
     return `Load this skill and resolve its dependencies: ${exactSkillName}`
   }
-  return `Find the best matching skill and resolve its dependencies for this query: ${query}`
+  return `Find the best matching skill(s) and resolve their dependencies for this query: ${query}`
 }
 
 const SKILL_RESOLVER_CONFIG = JSON.stringify({
