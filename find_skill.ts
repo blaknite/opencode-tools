@@ -124,61 +124,107 @@ async function discoverSkills(worktree: string): Promise<SkillMeta[]> {
 // LLM-based skill matching via opencode run
 // ---------------------------------------------------------------------------
 
-function buildPrompt(query: string, skills: SkillMeta[]): string {
-  const catalogue = skills
-    .map((s) => `- ${s.name}: ${s.description}`)
-    .join("\n")
+const SKILL_RESOLVER_SYSTEM_PROMPT = [
+  "You are a skill resolver. Follow these steps exactly:",
+  "",
+  "1. If a starting skill is provided, use it. Otherwise pick the best matching skill from the available skills list.",
+  "2. Use the `skill` tool to load it.",
+  "3. Identify any skills it explicitly requires the caller to load before continuing.",
+  "4. Use the `skill` tool to load each required skill and repeat until no more required skills remain.",
+  "5. Reply with ONLY a valid JSON array of skill names in order, starting skill first.",
+  '   For example: ["debugging-failed-builds","using-buildkite"]',
+  "   Return [] if nothing matched.",
+  "",
+  "Only include skills that are explicitly required or instructed. Ignore optional suggestions, examples, and loosely related references.",
+  "Use exact skill names. No explanation, no markdown, no prose.",
+].join("\n")
 
-  return [
-    "## Available skills",
-    "",
-    catalogue,
-    "",
-    "## Query",
-    "",
-    query,
-  ].join("\n")
+function buildResolverPrompt(query: string, exactSkillName?: string): string {
+  if (exactSkillName) {
+    return `Load this skill and resolve its dependencies: ${exactSkillName}`
+  }
+  return `Find the best matching skill and resolve its dependencies for this query: ${query}`
 }
 
-const SKILL_MATCHER_CONFIG = JSON.stringify({
+const SKILL_RESOLVER_CONFIG = JSON.stringify({
   agent: {
-    "skill-matcher": {
+    "skill-resolver": {
       mode: "all",
       hidden: true,
-      prompt: [
-        "You are a skill matcher. Given a user's query and a catalogue of available skills,",
-        "pick the single best matching skill. If no skill is relevant, say NONE.",
-        "",
-        "Reply with ONLY the skill name (e.g. `debugging-failed-builds`) or `NONE`.",
-        "No explanation, no punctuation, no markdown, just the name.",
-      ].join("\n"),
-      permission: { "*": "deny" },
+      prompt: SKILL_RESOLVER_SYSTEM_PROMPT,
+      permission: {
+        "*": "deny",
+        skill: "allow",
+      },
     },
   },
 })
 
-async function askAgent(prompt: string): Promise<string> {
+async function askAgent(prompt: string, worktree: string): Promise<string> {
   const proc = Bun.spawn(
-    ["opencode", "run", "--agent", "skill-matcher", "--dangerously-skip-permissions"],
+    ["opencode", "run", "--agent", "skill-resolver", "--dangerously-skip-permissions", "--format", "json"],
     {
+      cwd: worktree,
       stdout: "pipe",
       stderr: "pipe",
       stdin: "pipe",
       env: {
         ...process.env,
-        OPENCODE_CONFIG_CONTENT: SKILL_MATCHER_CONFIG,
+        OPENCODE_CONFIG_CONTENT: SKILL_RESOLVER_CONFIG,
       },
     },
   )
 
-  // write the prompt to stdin and close it
   proc.stdin.write(prompt)
   proc.stdin.end()
 
-  const output = await new Response(proc.stdout).text()
+  const raw = await new Response(proc.stdout).text()
   await proc.exited
 
-  return output.trim()
+  let sessionID: string | undefined
+  const textParts: string[] = []
+
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      const event = JSON.parse(trimmed)
+      if (!sessionID && event.sessionID) sessionID = event.sessionID
+      if (event.type === "text" && event.part?.text) textParts.push(event.part.text)
+    } catch {
+      // not JSON, skip
+    }
+  }
+
+  if (sessionID) {
+    await Bun.spawn(["opencode", "session", "delete", sessionID], {
+      cwd: worktree,
+      stdout: "ignore",
+      stderr: "ignore",
+    }).exited
+  }
+
+  return textParts.join("").trim()
+}
+
+function parseResolvedSkillNames(answer: string): string[] {
+  try {
+    const parsed = JSON.parse(answer)
+    if (!Array.isArray(parsed)) return []
+
+    const seen = new Set<string>()
+
+    return parsed
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim().toLowerCase())
+      .filter((value) => {
+        if (!value || seen.has(value)) return false
+        seen.add(value)
+        return true
+      })
+  } catch {
+    return []
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -221,22 +267,13 @@ export default tool({
     }
 
     const query = args.query.trim()
-
-    // fast path: exact name match (skip the LLM call)
     const exact = skills.find((s) => s.name === query)
-    if (exact) {
-      context.metadata({ title: exact.name })
-      return await formatSkillContent(exact)
-    }
 
-    // ask a fast agent to pick the best skill
-    const prompt = buildPrompt(query, skills)
-    const answer = await askAgent(prompt)
+    const prompt = buildResolverPrompt(query, exact?.name)
+    const answer = await askAgent(prompt, context.worktree)
 
-    // the agent should return just a skill name or NONE
-    const cleanAnswer = answer.replace(/`/g, "").trim().toLowerCase()
-
-    if (cleanAnswer === "none" || !cleanAnswer) {
+    const resolvedNames = parseResolvedSkillNames(answer)
+    if (resolvedNames.length === 0) {
       return (
         `No skill matched the query "${query}".\n\n` +
         "Available skill names for reference:\n" +
@@ -244,26 +281,39 @@ export default tool({
       )
     }
 
-    // find the skill the agent picked
-    const matched = skills.find((s) => s.name === cleanAnswer)
-    if (!matched) {
-      // agent returned something we don't recognise -- fall back to listing
+    const resolvedSkills = resolvedNames
+      .map((name) => skills.find((skill) => skill.name === name))
+      .filter((skill): skill is SkillMeta => Boolean(skill))
+
+    if (resolvedSkills.length === 0) {
       return (
-        `The skill matcher suggested "${answer}" but that skill was not found.\n\n` +
+        `The skill resolver suggested ${answer} but none of those skills were found.\n\n` +
         "Available skill names for reference:\n" +
         skills.map((s) => `- ${s.name}: ${s.description}`).join("\n")
       )
     }
 
-    context.metadata({ title: matched.name })
-    return await formatSkillContent(matched)
+    if (resolvedSkills.length !== resolvedNames.length) {
+      const missing = resolvedNames.filter(
+        (name) => !resolvedSkills.some((skill) => skill.name === name),
+      )
+
+      return (
+        `The skill resolver suggested missing skills: ${missing.join(", ")}.\n\n` +
+        "Available skill names for reference:\n" +
+        skills.map((s) => `- ${s.name}: ${s.description}`).join("\n")
+      )
+    }
+
+    context.metadata({ title: resolvedSkills[0].name })
+    return await formatSkillContent(resolvedSkills)
   },
 })
 
 async function listSkillFiles(skillLocation: string): Promise<string[]> {
   const dir = path.dirname(skillLocation)
   try {
-    const entries = await readdir(dir, { recursive: true })
+    const entries = (await readdir(dir, { recursive: true })) as string[]
     return entries
       .filter((e) => e !== "SKILL.md")
       .map((e) => path.resolve(dir, e))
@@ -273,23 +323,33 @@ async function listSkillFiles(skillLocation: string): Promise<string[]> {
   }
 }
 
-async function formatSkillContent(skill: SkillMeta): Promise<string> {
-  const dir = path.dirname(skill.location)
-  const files = await listSkillFiles(skill.location)
-  const fileList = files.map((f) => `<file>${f}</file>`).join("\n")
+async function formatSkillContent(skills: SkillMeta[]): Promise<string> {
+  const sections = await Promise.all(
+    skills.map(async (skill) => {
+      const dir = path.dirname(skill.location)
+      const files = await listSkillFiles(skill.location)
+      const fileList = files.map((f) => `<file>${f}</file>`).join("\n")
 
-  return [
-    `<skill_content name="${skill.name}">`,
-    `# Skill: ${skill.name}`,
-    "",
-    skill.body.trim(),
-    "",
-    `Base directory for this skill: ${dir}`,
-    "Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.",
-    "",
-    "<skill_files>",
-    fileList,
-    "</skill_files>",
-    "</skill_content>",
-  ].join("\n")
+      return [
+        `<skill_content name="${skill.name}">`,
+        `# Skill: ${skill.name}`,
+        "",
+        "Read this skill before acting.",
+        "Required dependent skills have already been loaded below when they were found.",
+        "If you discover another required skill that is not included here, call `find_skill` for it before continuing.",
+        "",
+        skill.body.trim(),
+        "",
+        `Base directory for this skill: ${dir}`,
+        "Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.",
+        "",
+        "<skill_files>",
+        fileList,
+        "</skill_files>",
+        "</skill_content>",
+      ].join("\n")
+    }),
+  )
+
+  return sections.join("\n\n")
 }
