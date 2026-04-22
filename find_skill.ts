@@ -125,18 +125,22 @@ async function discoverSkills(worktree: string): Promise<SkillMeta[]> {
 // ---------------------------------------------------------------------------
 
 const SKILL_RESOLVER_SYSTEM_PROMPT = [
-  "You are a skill resolver. Follow these steps exactly:",
+  "You are a skill resolver. Your job is to identify which skills, if any, are relevant to the given query and load them.",
   "",
-  "1. If a starting skill is provided, use it. Otherwise pick the best matching skill(s) from the available skills list.",
-  "2. Use the `skill` tool to load them.",
-  "3. Check for required dependencies and load them.",
-  "4. Repeat until no more required skills remain.",
-  "5. Your final message must be a valid JSON array of skill names and nothing else. No prose before it, no prose after it, no markdown formatting.",
-  '   For example: ["debugging-failed-builds","using-buildkite"]',
-  "   Return [] if nothing matched.",
+  "A skill is relevant when following it would directly guide the work described. The match should be on substance: the query and the skill should be about the same thing. Shared vocabulary is not enough.",
   "",
-  "If the query covers multiple concepts, return multiple skills that match. Include all relevant skills, not just one.",
-  "Only include skills that are explicitly required or instructed. Ignore optional suggestions, examples, and loosely related references.",
+  "Follow these steps:",
+  "",
+  "1. If a specific skill name is provided, load that skill. Otherwise, identify the best matching skill(s) from the available list based on the substance of the query.",
+  "2. Use the `skill` tool to load the identified skill(s).",
+  "3. Check each loaded skill for required dependencies and load those too.",
+  "4. Repeat until no more required dependencies remain.",
+  "5. Your final message must be a valid JSON array of exact skill names. No prose before it, no prose after it, no markdown, no explanation.",
+  "   Any text outside the JSON array will cause a parse failure.",
+  '   Example: ["debugging-failed-builds","using-buildkite"]',
+  "   If no skills are relevant, return [].",
+  "",
+  "When a query covers multiple distinct topics, include all relevant skills. When nothing is a genuine match, return [] rather than forcing a close-enough result.",
   "Use exact skill names.",
 ].join("\n");
 
@@ -210,22 +214,41 @@ async function askAgent(
 
   let sessionID: string | undefined;
   const textParts: string[] = [];
+  let sawStructuredOutput = false;
 
   try {
-    const raw = await new Response(proc.stdout).text();
-    await proc.exited;
+    const [raw, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    if (exitCode !== 0) {
+      const detail = stderr.trim() || "No stderr output.";
+      throw new Error(
+        `Skill resolver exited with code ${exitCode}.\n\n${detail}`,
+      );
+    }
 
     for (const line of raw.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
         const event = JSON.parse(trimmed);
+        sawStructuredOutput = true;
         if (!sessionID && event.sessionID) sessionID = event.sessionID;
         if (event.type === "text" && event.part?.text)
           textParts.push(event.part.text);
       } catch {
         // not JSON, skip
       }
+    }
+
+    if (!sawStructuredOutput) {
+      const detail = raw.trim() || "No stdout output.";
+      throw new Error(
+        `Skill resolver returned unparseable output.\n\n${detail}`,
+      );
     }
   } finally {
     abort?.removeEventListener("abort", onAbort);
@@ -239,7 +262,17 @@ async function askAgent(
     }
   }
 
-  return textParts.join("").trim().split("\n").at(-1) ?? "";
+  const full = textParts.join("").trim();
+  if (!full) {
+    throw new Error("Skill resolver returned no text response.");
+  }
+
+  const match = full.match(/\[.*\]/s);
+  if (!match) {
+    throw new Error(`Skill resolver returned no JSON array: ${JSON.stringify(full)}`);
+  }
+
+  return match[0];
 }
 
 function parseResolvedSkillNames(answer: string): string[] {
@@ -274,10 +307,8 @@ function humanize(name: string): string {
 const bootSkills = await discoverSkills(process.cwd());
 const skillList = bootSkills.map((s) => humanize(s.name)).join(", ");
 const description = [
-  "Find domain-specific instructions by describing what you're about to do. " +
-    "Skills contain step-by-step workflows, scripts, and conventions you " +
-    "wouldn't otherwise know about. Loading the right skill early saves " +
-    "time and avoids mistakes. Describe what you need in natural language.",
+  "Find domain-specific instructions by describing the task you are about to perform. " +
+    "Skills contain step-by-step workflows, scripts, and conventions specific to this environment.",
   "",
   bootSkills.length > 0
     ? `Skills cover things like: ${skillList}.`
@@ -290,8 +321,12 @@ export default tool({
     query: tool.schema
       .string()
       .describe(
-        "What you need help with. Can be a natural language description " +
-          "of the task, or an exact skill name if you know it.",
+        "The task you are about to perform, described in terms of what you are trying to accomplish. " +
+          "Describe the goal, not the method. Keep it short. " +
+          "Use an exact skill name if you already know it. " +
+          "Examples: user says 'can you look at this PR?' -> query 'reviewing a pull request'; " +
+          "user says 'the build is red' -> query 'build is failing'; " +
+          "user says 'write me a ticket for this' -> query 'writing an issue'.",
       ),
   },
   async execute(args, context) {
@@ -314,11 +349,13 @@ export default tool({
 
     const resolvedNames = parseResolvedSkillNames(answer);
     if (resolvedNames.length === 0) {
-      return (
-        `No skill matched the query "${query}".\n\n` +
-        "Available skill names for reference:\n" +
-        skills.map((s) => `- ${s.name}`).join("\n")
-      );
+      if (answer !== "[]") {
+        throw new Error(
+          `Skill resolver returned invalid JSON: ${JSON.stringify(answer)}`,
+        );
+      }
+
+      return `No skill matched the query "${query}".`;
     }
 
     const resolvedSkills = resolvedNames
@@ -326,11 +363,7 @@ export default tool({
       .filter((skill): skill is SkillMeta => Boolean(skill));
 
     if (resolvedSkills.length === 0) {
-      return (
-        `The skill resolver suggested ${answer} but none of those skills were found.\n\n` +
-        "Available skill names for reference:\n" +
-        skills.map((s) => `- ${s.name}: ${s.description}`).join("\n")
-      );
+      return `The skill resolver suggested unknown skills: ${answer}.`;
     }
 
     if (resolvedSkills.length !== resolvedNames.length) {
@@ -338,11 +371,7 @@ export default tool({
         (name) => !resolvedSkills.some((skill) => skill.name === name),
       );
 
-      return (
-        `The skill resolver suggested missing skills: ${missing.join(", ")}.\n\n` +
-        "Available skill names for reference:\n" +
-        skills.map((s) => `- ${s.name}: ${s.description}`).join("\n")
-      );
+      return `The skill resolver suggested missing skills: ${missing.join(", ")}.`;
     }
 
     context.metadata({ title: resolvedSkills[0].name });
