@@ -269,7 +269,9 @@ async function askAgent(
 
   const match = full.match(/\[.*\]/s);
   if (!match) {
-    throw new Error(`Skill resolver returned no JSON array: ${JSON.stringify(full)}`);
+    throw new Error(
+      `Skill resolver returned no JSON array: ${JSON.stringify(full)}`,
+    );
   }
 
   return match[0];
@@ -307,8 +309,10 @@ function humanize(name: string): string {
 const bootSkills = await discoverSkills(process.cwd());
 const skillList = bootSkills.map((s) => humanize(s.name)).join(", ");
 const description = [
-  "Find domain-specific instructions by describing the task you are about to perform. " +
+  "Load domain-specific workflows and conventions for a goal you are starting. " +
     "Skills contain step-by-step workflows, scripts, and conventions specific to this environment.",
+  "",
+  "Call this when starting a new goal. Skip it for clarifications, follow-ups, or continued work on an existing goal.",
   "",
   bootSkills.length > 0
     ? `Skills cover things like: ${skillList}.`
@@ -321,7 +325,7 @@ export default tool({
     query: tool.schema
       .string()
       .describe(
-        "The task you are about to perform, described in terms of what you are trying to accomplish. " +
+        "The goal you are starting, described in terms of what you are trying to accomplish. " +
           "Describe the goal, not the method. Keep it short. " +
           "Use an exact skill name if you already know it. " +
           "Examples: user says 'can you look at this PR?' -> query 'reviewing a pull request'; " +
