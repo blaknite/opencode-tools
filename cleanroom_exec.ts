@@ -25,7 +25,8 @@ async function findGitRoot(cwd: string): Promise<string | null> {
       stdout: "pipe",
       stderr: "pipe",
     })
-    const { stdout } = await proc.exited
+    const stdout = await new Response(proc.stdout).text()
+    await proc.exited
     return stdout.trim()
   } catch {
     return null
@@ -137,96 +138,98 @@ IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO N
       return `Repository is missing a cleanroom.yaml policy file. Expected at ${join(root, "cleanroom.yaml")} or ${join(root, ".buildkite", "cleanroom.yaml")}. See the cleanroom spec for how to create one.`
     }
 
-const timeoutMs = args.timeout ?? 120000
-const abortSignal = context.abort
+    const timeoutMs = args.timeout ?? 120000
+    const abortSignal = context.abort
 
-let stdout = ""
-let stderr = ""
-let exitCode: number | null = null
-let timedOut = false
-let userAborted = false
+    let stdout = ""
+    let stderr = ""
+    let exitCode: number | null = null
+    let timedOut = false
+    let userAborted = false
 
-const proc = Bun.spawn(
-  [cleanroomPath, "exec", "--include-local-changes", "--no-stdin", "--", "sh", "-c", args.command],
-  {
-    cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-    stdin: "ignore",
-    env: { ...process.env },
+    const proc = Bun.spawn(
+      [cleanroomPath, "exec", "--include-local-changes", "--no-stdin", "--", "sh", "-c", args.command],
+      {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+        env: { ...process.env },
+      },
+    )
+
+    const timeoutId = setTimeout(() => {
+      timedOut = true
+      proc.kill("SIGINT")
+    }, timeoutMs)
+
+    abortSignal.addEventListener("abort", () => {
+      clearTimeout(timeoutId)
+      userAborted = true
+      proc.kill("SIGINT")
+    })
+
+    async function pushMetadata() {
+      const combined = stdout + stderr
+      context.metadata({
+        metadata: {
+          output: combined ? combined.slice(-200) : "(no output)",
+          description: args.description,
+        },
+      })
+    }
+
+    const combinedStream = async () => {
+      const decoder = new TextDecoder()
+      const chunks: Uint8Array[] = []
+      
+      const stdoutTask = (async () => {
+        for await (const chunk of proc.stdout) {
+          chunks.push(chunk)
+          stdout += decoder.decode(chunk, { stream: true })
+          await pushMetadata()
+        }
+      })()
+      
+      const stderrTask = (async () => {
+        for await (const chunk of proc.stderr) {
+          chunks.push(chunk)
+          stderr += decoder.decode(chunk, { stream: true })
+          await pushMetadata()
+        }
+      })()
+      
+      await Promise.all([stdoutTask, stderrTask])
+    }
+
+    const [combinedOutput, exitCodeResult] = await Promise.all([
+      combinedStream(),
+      proc.exited,
+    ])
+
+    exitCode = exitCodeResult
+
+    let output = stdout + stderr
+    if (exitCode !== 0) {
+      const hint = translateCleanroomError(stderr)
+      output = `${output}\n\n${hint}`
+    }
+
+    context.metadata({
+      metadata: {
+        output: output.slice(-200),
+        exit: exitCode,
+        description: args.description,
+      },
+    })
+
+    if (timedOut) {
+      return `cleanroom_exec terminated command after exceeding timeout ${timeoutMs} ms.`
+    }
+    if (userAborted) {
+      return "Command was aborted."
+    }
+
+    return output
   },
-)
-
-const timeoutId = setTimeout(() => {
-  timedOut = true
-  proc.kill("SIGINT")
-}, timeoutMs)
-
-abortSignal.addEventListener("abort", () => {
-  clearTimeout(timeoutId)
-  userAborted = true
-  proc.kill("SIGINT")
-})
-
-proc.stdout.on("data", (chunk: Uint8Array) => {
-  const text = chunk.toString()
-  stdout += text
-
-  context.metadata({
-    metadata: {
-      output: (stdout || "(no output)").slice(-200),
-      description: args.description,
-    },
-  })
-})
-
-proc.stderr.on("data", (chunk: Uint8Array) => {
-  const text = chunk.toString()
-  stderr += text
-
-  context.metadata({
-    metadata: {
-      output: (stdout + stderr || "(no output)").slice(-200),
-      description: args.description,
-    },
-  })
-})
-
-proc.on("error", (err) => {
-  throw err
-})
-
-proc.on("close", async (code) => {
-  clearTimeout(timeoutId)
-  exitCode = code
-
-  let output = stdout + stderr
-  if (exitCode !== 0) {
-    const hint = translateCleanroomError(stderr)
-    output = `${output}\n\n${hint}`
-  }
-
-  context.metadata({
-    metadata: {
-      output: output.slice(-200),
-      exit: exitCode,
-      description: args.description,
-    },
-  })
-})
-
-const result = await new Promise<string>((resolve, reject) => {
-  proc.on("error", reject)
-  proc.on("close", () => resolve(exitCode === 0 ? (stdout + stderr) : stderr))
-})
-
-if (timedOut) {
-  return `cleanroom_exec terminated command after exceeding timeout ${timeoutMs} ms.`
-}
-if (userAborted) {
-  return "Command was aborted."
-}
-
-return result as { output: string; metadata?: { output: string; exit: number | null; description: string; truncated: boolean } }
-  },
-})
+}) as ReturnType<typeof tool>
