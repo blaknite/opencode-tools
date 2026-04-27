@@ -1,59 +1,31 @@
 import { tool } from "@opencode-ai/plugin"
-import { spawn } from "child_process"
-import { mkdir } from "fs/promises"
 import { join } from "path"
-import { promisify } from "util"
-
-const exec = promisify(spawn)
-
-const MAX_BYTES = 1024 * 1024
-const MAX_LINES = 5000
+import { stat } from "fs/promises"
 
 async function which(cmd: string): Promise<string | null> {
   try {
-    const { stdout } = await exec(`which ${cmd}`, { maxBuffer: 1024 * 1024 })
-    return stdout.trim()
+    return Bun.which(cmd)
   } catch {
     return null
   }
 }
 
-async function isGitRepo(cwd: string): Promise<boolean> {
+async function fileExists(path: string): Promise<boolean> {
   try {
-    await exec(`git rev-parse --show-toplevel`, { cwd, maxBuffer: 1024 * 1024 })
-    return true
+    return (await stat(path)).isFile()
   } catch {
     return false
   }
 }
 
-async function findPolicyFile(cwd: string): Promise<string | null> {
-  const root = await findGitRoot(cwd)
-  if (!root) return null
-
-  const policyPaths = [
-    join(root, "cleanroom.yaml"),
-    join(root, ".buildkite", "cleanroom.yaml"),
-  ]
-
-  for (const path of policyPaths) {
-    try {
-      await mkdir(join(path), { recursive: true }).catch(() => {})
-      await exec(`test -f ${path}`, { maxBuffer: 1024 * 1024 })
-      return path
-    } catch {
-      continue
-    }
-  }
-  return null
-}
-
 async function findGitRoot(cwd: string): Promise<string | null> {
   try {
-    const { stdout } = await exec(`git rev-parse --show-toplevel`, {
+    const proc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
       cwd,
-      maxBuffer: 1024 * 1024,
+      stdout: "pipe",
+      stderr: "pipe",
     })
+    const { stdout } = await proc.exited
     return stdout.trim()
   } catch {
     return null
@@ -76,6 +48,23 @@ async function resolveWorkdir(workdir: string | undefined, directory: string): P
   }
 
   return resolved
+}
+
+async function findPolicyFile(cwd: string): Promise<string | null> {
+  const root = await findGitRoot(cwd)
+  if (!root) return null
+
+  const policyPaths = [
+    join(root, "cleanroom.yaml"),
+    join(root, ".buildkite", "cleanroom.yaml"),
+  ]
+
+  for (const path of policyPaths) {
+    if (await fileExists(path)) {
+      return path
+    }
+  }
+  return null
 }
 
 function translateCleanroomError(stderr: string): string {
@@ -148,122 +137,96 @@ IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO N
       return `Repository is missing a cleanroom.yaml policy file. Expected at ${join(root, "cleanroom.yaml")} or ${join(root, ".buildkite", "cleanroom.yaml")}. See the cleanroom spec for how to create one.`
     }
 
-    const timeoutMs = args.timeout ?? 120000
-    const abortSignal = context.abort
+const timeoutMs = args.timeout ?? 120000
+const abortSignal = context.abort
 
-    const proc = spawn(
-      join(cleanroomPath, "cleanroom"),
-      ["exec", "--include-local-changes", "--no-stdin", "--", "sh", "-c", args.command],
-      {
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-        stdin: "ignore",
-        env: { ...process.env },
-      },
-    )
+let stdout = ""
+let stderr = ""
+let exitCode: number | null = null
+let timedOut = false
+let userAborted = false
 
-    const timeoutId = setTimeout(() => {
-      proc.kill("SIGINT")
-    }, timeoutMs)
+const proc = Bun.spawn(
+  [cleanroomPath, "exec", "--include-local-changes", "--no-stdin", "--", "sh", "-c", args.command],
+  {
+    cwd,
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: "ignore",
+    env: { ...process.env },
+  },
+)
 
-    abortSignal.addEventListener("abort", () => {
-      clearTimeout(timeoutId)
-      proc.kill("SIGINT")
-    })
+const timeoutId = setTimeout(() => {
+  timedOut = true
+  proc.kill("SIGINT")
+}, timeoutMs)
 
-    let stdout = ""
-    let stderr = ""
-    let exitCode: number | null = null
-    let terminated = false
+abortSignal.addEventListener("abort", () => {
+  clearTimeout(timeoutId)
+  userAborted = true
+  proc.kill("SIGINT")
+})
 
-    proc.stdout.on("data", (chunk: Buffer) => {
-      const text = chunk.toString()
-      stdout += text
+proc.stdout.on("data", (chunk: Uint8Array) => {
+  const text = chunk.toString()
+  stdout += text
 
-      context.metadata({
-        metadata: {
-          output: (stdout || "(no output)").slice(-200),
-          description: args.description,
-        },
-      })
-    })
+  context.metadata({
+    metadata: {
+      output: (stdout || "(no output)").slice(-200),
+      description: args.description,
+    },
+  })
+})
 
-    proc.stderr.on("data", (chunk: Buffer) => {
-      const text = chunk.toString()
-      stderr += text
+proc.stderr.on("data", (chunk: Uint8Array) => {
+  const text = chunk.toString()
+  stderr += text
 
-      context.metadata({
-        metadata: {
-          output: (stdout || stderr || "(no output)").slice(-200),
-          description: args.description,
-        },
-      })
-    })
+  context.metadata({
+    metadata: {
+      output: (stdout + stderr || "(no output)").slice(-200),
+      description: args.description,
+    },
+  })
+})
 
-    proc.on("close", (code) => {
-      clearTimeout(timeoutId)
+proc.on("error", (err) => {
+  throw err
+})
 
-      if (code === null) {
-        terminated = true
-        exitCode = 0
-        return
-      }
+proc.on("close", async (code) => {
+  clearTimeout(timeoutId)
+  exitCode = code
 
-      exitCode = code
+  let output = stdout + stderr
+  if (exitCode !== 0) {
+    const hint = translateCleanroomError(stderr)
+    output = `${output}\n\n${hint}`
+  }
 
-      let output = stdout || stderr || "(no output)"
-      if (exitCode !== 0) {
-        const hint = translateCleanroomError(stderr)
-        output = `${output}\n\n${hint}`
-      }
+  context.metadata({
+    metadata: {
+      output: output.slice(-200),
+      exit: exitCode,
+      description: args.description,
+    },
+  })
+})
 
-      context.metadata({
-        metadata: {
-          output: output.slice(-200),
-          exit: exitCode,
-          description: args.description,
-        },
-      })
-    })
+const result = await new Promise<string>((resolve, reject) => {
+  proc.on("error", reject)
+  proc.on("close", () => resolve(exitCode === 0 ? (stdout + stderr) : stderr))
+})
 
-    await new Promise<void>((resolve, reject) => {
-      let hasError = false
+if (timedOut) {
+  return `cleanroom_exec terminated command after exceeding timeout ${timeoutMs} ms.`
+}
+if (userAborted) {
+  return "Command was aborted."
+}
 
-      proc.on("error", (err) => {
-        hasError = true
-        reject(err)
-      })
-
-      proc.on("close", () => {
-        if (hasError) {
-          reject(new Error("Process terminated unexpectedly"))
-        } else {
-          resolve()
-        }
-      })
-    })
-
-    if (terminated) {
-      return {
-        output: `cleanroom_exec terminated command after exceeding timeout ${timeoutMs} ms.`,
-        metadata: {
-          output: "Command timed out and was terminated.",
-          exit: null,
-          description: args.description,
-          truncated: true,
-        },
-      }
-    }
-
-    return {
-      output: exitCode === 0 ? (stdout || "(no output)") : stderr,
-      metadata: {
-        output: (stdout || stderr || "(no output)").slice(-200),
-        exit: exitCode,
-        description: args.description,
-        truncated: false,
-      },
-    }
+return result as { output: string; metadata?: { output: string; exit: number | null; description: string; truncated: boolean } }
   },
 })
