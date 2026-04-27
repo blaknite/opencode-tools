@@ -203,27 +203,27 @@ const [_, exitCodeResult] = await Promise.all([
   proc.exited,
 ])
 
-    exitCode = exitCodeResult
+exitCode = exitCodeResult
 
-    let output = stdout + stderr
-    const hint = translateCleanroomError(stderr)
-    if (hint) output += `\n\n${hint}`
+let output = stdout + stderr
+const hint = translateCleanroomError(stderr)
+if (hint) output += `\n\n${hint}`
 
-    context.metadata({
-      metadata: {
-        output: output.slice(-200),
-        exit: exitCode,
-        description: args.description,
-      },
-    })
+context.metadata({
+  metadata: {
+    output: output.slice(-200),
+    exit: exitCode,
+    description: args.description,
+  },
+})
 
-    if (timedOut) {
-      return `cleanroom_exec terminated command after exceeding timeout ${timeoutMs} ms.`
-    }
-    if (userAborted) {
-      return "Command was aborted."
-    }
+if (timedOut) {
+  return `cleanroom_exec terminated command after exceeding timeout ${timeoutMs} ms.`
+}
+if (userAborted) {
+  return "Command was aborted."
+}
 
-    return output
+return output
   },
 }) as ReturnType<typeof tool>
