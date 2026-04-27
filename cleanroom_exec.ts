@@ -68,18 +68,17 @@ async function findPolicyFile(cwd: string): Promise<string | null> {
   return null
 }
 
-function translateCleanroomError(stderr: string): string {
-  let hint = stderr
-
+function translateCleanroomError(stderr: string): string | null {
   if (stderr.includes("policy not found") || stderr.includes("no policy file")) {
-    hint += "\n\nMake sure the repository has a cleanroom.yaml policy file at the root or under .buildkite/. Run `cleanroom config init` to create a runtime config, but you also need a policy file in the repo."
-  } else if (stderr.includes("daemon") || stderr.includes("connection refused") || stderr.includes("dial unix")) {
-    hint += "\n\nThe cleanroom daemon is not running. Start it with `cleanroom daemon start` (or `cleanroom serve` for foreground)."
-  } else if (stderr.includes("repository") || stderr.includes("not a repository")) {
-    hint += "\n\nCleanroom requires a git repository. Make sure you're running from inside a git repo."
+    return "Make sure the repository has a cleanroom.yaml policy file at the root or under .buildkite/. Run `cleanroom config init` to create a runtime config, but you also need a policy file in the repo."
   }
-
-  return hint
+  if (stderr.includes("daemon") || stderr.includes("connection refused") || stderr.includes("dial unix")) {
+    return "The cleanroom daemon is not running. Start it with `cleanroom daemon start` (or `cleanroom serve` for foreground)."
+  }
+  if (stderr.includes("repository") || stderr.includes("not a repository")) {
+    return "Cleanroom requires a git repository. Make sure you're running from inside a git repo."
+  }
+  return null
 }
 
 export default tool({
@@ -181,11 +180,9 @@ IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO N
 
     const combinedStream = async () => {
       const decoder = new TextDecoder()
-      const chunks: Uint8Array[] = []
       
       const stdoutTask = (async () => {
         for await (const chunk of proc.stdout) {
-          chunks.push(chunk)
           stdout += decoder.decode(chunk, { stream: true })
           await pushMetadata()
         }
@@ -193,7 +190,6 @@ IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO N
       
       const stderrTask = (async () => {
         for await (const chunk of proc.stderr) {
-          chunks.push(chunk)
           stderr += decoder.decode(chunk, { stream: true })
           await pushMetadata()
         }
@@ -202,18 +198,16 @@ IMPORTANT: This tool is for terminal operations like git, npm, docker, etc. DO N
       await Promise.all([stdoutTask, stderrTask])
     }
 
-    const [combinedOutput, exitCodeResult] = await Promise.all([
-      combinedStream(),
-      proc.exited,
-    ])
+const [_, exitCodeResult] = await Promise.all([
+  combinedStream(),
+  proc.exited,
+])
 
     exitCode = exitCodeResult
 
     let output = stdout + stderr
-    if (exitCode !== 0) {
-      const hint = translateCleanroomError(stderr)
-      output = `${output}\n\n${hint}`
-    }
+    const hint = translateCleanroomError(stderr)
+    if (hint) output += `\n\n${hint}`
 
     context.metadata({
       metadata: {
